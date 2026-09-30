@@ -11,7 +11,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from . import nvfp4
+from .. import fast, prof
+from . import fused_ops as fo
+from . import gdn_glue, nvfp4
 from .config import TextConfig
 from .ops import attn_cached, attn_full, gdn_core
 
@@ -25,9 +27,7 @@ class RMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.zeros(dim), requires_grad=False)
 
     def forward(self, x):
-        y = x.float()
-        y = y * torch.rsqrt(y.pow(2).mean(-1, keepdim=True) + self.eps)
-        return (y * (1.0 + self.weight.float())).type_as(x)
+        return fo.rmsnorm(x, self.weight, self.eps)
 
 
 class RMSNormGated(nn.Module):
@@ -39,11 +39,10 @@ class RMSNormGated(nn.Module):
         self.weight = nn.Parameter(torch.ones(dim), requires_grad=False)
 
     def forward(self, x, gate):
-        dt = x.dtype
-        y = x.float()
-        y = y * torch.rsqrt(y.pow(2).mean(-1, keepdim=True) + self.eps)
-        y = self.weight * y.to(dt)
-        return (y * F.silu(gate.float())).to(dt)
+        if fast.enabled("gdn_glue") and gdn_glue.norm_ok() and x.is_cuda:
+            with prof.rf("b:elementwise"):
+                return gdn_glue.fla_gated_norm(x, gate, self.weight, self.eps)
+        return fo.rmsnorm_gated(x, gate, self.weight, self.eps)
 
 
 class QLinear(nn.Module):
@@ -73,11 +72,47 @@ class QLinear(nn.Module):
         self.lora_B = nn.Parameter(torch.zeros(self.out_features, r, device=dev, dtype=torch.float32))
         self.lora_scale = alpha / r
 
+    def base(self, x):
+        """Frozen part only (FP4 or dense), without LoRA."""
+        return nvfp4.fp4_linear(x, self.fp4) if self.fp4 is not None else F.linear(x, self.weight)
+
     def forward(self, x):
-        y = nvfp4.fp4_linear(x, self.fp4) if self.fp4 is not None else F.linear(x, self.weight)
+        y = self.base(x)
         if self.lora_A is not None:
-            y = y + F.linear(F.linear(x, self.lora_A.to(x.dtype)), self.lora_B.to(x.dtype)) * self.lora_scale
+            with prof.rf("b:lora"):
+                y = y + F.linear(F.linear(x, self.lora_A.to(x.dtype)), self.lora_B.to(x.dtype)) * self.lora_scale
         return y
+
+
+def grouped_linear(x, lins):
+    """Outputs of several linears that share the input x. With LoRA fusion on, the A matrices of the group
+    are concatenated into ONE GEMM and each B-product is accumulated straight into that linear's base output
+    with addmm (no separate elementwise add). Same math as calling each linear separately."""
+    ys = [l.base(x) for l in lins]
+    if not any(l.lora_A is not None for l in lins):
+        return ys
+    if not fast.enabled("lora"):
+        outs = []
+        for l, y in zip(lins, ys):
+            if l.lora_A is not None:
+                with prof.rf("b:lora"):
+                    y = y + F.linear(F.linear(x, l.lora_A.to(x.dtype)), l.lora_B.to(x.dtype)) * l.lora_scale
+            outs.append(y)
+        return outs
+    with prof.rf("b:lora"):
+        act = [l for l in lins if l.lora_A is not None]
+        h = F.linear(x, torch.cat([l.lora_A for l in act], 0).to(x.dtype))     # [.., sum r]
+        off, outs = 0, []
+        for l, y in zip(lins, ys):
+            if l.lora_A is None:
+                outs.append(y)
+                continue
+            r = l.lora_A.shape[0]
+            hi = h[..., off:off + r].reshape(-1, r)
+            off += r
+            o = torch.addmm(y.reshape(-1, l.out_features), hi, l.lora_B.to(x.dtype).t(), alpha=l.lora_scale)
+            outs.append(o.reshape(*y.shape))
+        return outs
 
 
 class MLP(nn.Module):
@@ -88,7 +123,8 @@ class MLP(nn.Module):
         self.down_proj = QLinear(c.intermediate_size, c.hidden_size)
 
     def forward(self, x):
-        return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
+        g, u = grouped_linear(x, [self.gate_proj, self.up_proj])
+        return self.down_proj(fo.swiglu(g, u))
 
 
 @dataclass
@@ -137,22 +173,29 @@ class GatedDeltaNet(nn.Module):
         c = self.c
         b, t, _ = x.shape
         km1 = c.linear_conv_kernel_dim - 1
-        mixed = self.in_proj_qkv(x).transpose(1, 2)                    # [B, C, T]
-        z = self.in_proj_z(x).reshape(b, t, -1, c.linear_value_head_dim)
+        qkv, z = grouped_linear(x, [self.in_proj_qkv, self.in_proj_z])
+        z = z.reshape(b, t, -1, c.linear_value_head_dim)
         beta = self.in_proj_b(x).sigmoid()
         a = self.in_proj_a(x)
-        prev = (cache.conv_state if cache is not None and cache.conv_state is not None
-                else torch.zeros(b, c.conv_dim, km1, dtype=mixed.dtype, device=mixed.device))
-        cat = torch.cat([prev.to(mixed.dtype), mixed], dim=-1)
-        conv = F.silu(F.conv1d(cat, self.conv1d.weight.to(mixed.dtype), groups=c.conv_dim))
-        if cache is not None:
-            cache.conv_state = cat[..., -km1:].detach().clone()
-        conv = conv.transpose(1, 2)
+        prev = cache.conv_state if cache is not None else None
+        if fast.enabled("gdn_glue") and gdn_glue.conv_ok() and qkv.is_cuda:
+            with prof.rf("b:elementwise"):
+                conv, new_state = gdn_glue.fla_conv(qkv, self.conv1d.weight, prev, cache is not None)
+            if cache is not None:
+                cache.conv_state = new_state.detach().clone()
+        else:
+            mixed = qkv.transpose(1, 2)                                     # [B, C, T]
+            prev = (prev if prev is not None
+                    else torch.zeros(b, c.conv_dim, km1, dtype=mixed.dtype, device=mixed.device))
+            cat = torch.cat([prev.to(mixed.dtype), mixed], dim=-1)
+            conv = F.silu(F.conv1d(cat, self.conv1d.weight.to(mixed.dtype), groups=c.conv_dim)).transpose(1, 2)
+            if cache is not None:
+                cache.conv_state = cat[..., -km1:].detach().clone()
         q, k, v = torch.split(conv, [c.key_dim, c.key_dim, c.value_dim], dim=-1)
         q = q.reshape(b, t, -1, c.linear_key_head_dim)
         k = k.reshape(b, t, -1, c.linear_key_head_dim)
         v = v.reshape(b, t, -1, c.linear_value_head_dim)
-        g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias.float())
+        g = fo.gdn_gates(a, self.A_log, self.dt_bias)
         rep = c.linear_num_value_heads // c.linear_num_key_heads
         if rep > 1:
             q, k = q.repeat_interleave(rep, dim=2), k.repeat_interleave(rep, dim=2)
@@ -178,10 +221,7 @@ def rope_cos_sin(positions: torch.Tensor, rot_dim: int, theta: float):
 
 def apply_rope(x, cos, sin):
     """x [B,H,T,D]; rotates the first cos.shape[-1] dims."""
-    r = cos.shape[-1]
-    xr, xp = x[..., :r], x[..., r:]
-    cos, sin = cos.to(x.dtype)[None, None], sin.to(x.dtype)[None, None]
-    return torch.cat([xr * cos + _rotate_half(xr) * sin, xp], dim=-1)
+    return fo.rope(x, cos, sin)
 
 
 class Attention(nn.Module):
@@ -200,11 +240,12 @@ class Attention(nn.Module):
         c = self.c
         b, t, _ = x.shape
         d = c.head_dim
-        q, gate = self.q_proj(x).view(b, t, -1, d * 2).chunk(2, dim=-1)
+        qg, kp, vp = grouped_linear(x, [self.q_proj, self.k_proj, self.v_proj])
+        q, gate = qg.view(b, t, -1, d * 2).chunk(2, dim=-1)
         gate = gate.reshape(b, t, -1)
         q = self.q_norm(q).transpose(1, 2)
-        k = self.k_norm(self.k_proj(x).view(b, t, -1, d)).transpose(1, 2)
-        v = self.v_proj(x).view(b, t, -1, d).transpose(1, 2)
+        k = self.k_norm(kp.view(b, t, -1, d)).transpose(1, 2)
+        v = vp.view(b, t, -1, d).transpose(1, 2)
         pos = torch.arange(pos_offset, pos_offset + t, device=x.device)
         cos, sin = rope_cos_sin(pos, c.rotary_dim, c.rope_theta)
         q, k = apply_rope(q, cos, sin), apply_rope(k, cos, sin)
@@ -215,7 +256,7 @@ class Attention(nn.Module):
             o = attn_cached(q, k, v)
         else:
             o = attn_full(q, k, v)
-        o = o.transpose(1, 2).reshape(b, t, -1) * torch.sigmoid(gate)
+        o = fo.gate_mul(o.transpose(1, 2).reshape(b, t, -1), gate)
         return self.o_proj(o)
 
 

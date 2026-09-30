@@ -81,6 +81,22 @@ RECANT_TOKENIZER_DIR=/path/to/Qwen3.5-9B-tokenizer-dir python -m pytest tests -q
 샘플한 커밋 턴마다 캐시를 fork해 `힌트+턴`을 돌려 `p_full`(top-256+꼬리)만 저장 → 기록한 최종 hidden에서 `p_plain`·
 크기 타깃 계산 → 헤드/손실 → 층별로 입력에서 재계산하며 역전파. 본 forward를 별도로 한 번 더 돌지 않는다.
 
+## 처리량 최적화 (결과 동일, 자동 폴백)
+
+수학을 바꾸지 않는 융합 경로들이 있고, 시작 시 `backends.json["fast_paths"]`에 self-check 결과가 기록된다.
+검사에 실패하거나 GPU가 아니면 참조 구현으로 내려간다(속도만 잃음).
+
+| 이름 | 내용 |
+|---|---|
+| `quantize` | Triton 융합 NVFP4 양자화(RHT+amax+스케일+반올림+패킹). RTN은 참조와 비트 동일 |
+| `lora` | 같은 입력을 쓰는 LoRA A를 묶어 GEMM 1회 + `addmm` 누적 (저장 포맷 동일) |
+| `elementwise` | RMSNorm/SwiGLU/gate/RoPE/GDN 게이트를 `torch.compile` |
+| `gdn_glue` | fla causal-conv / gated-RMSNorm 커널 |
+| `attn` | 캐시 경로 어텐션을 (접두부 flash + 대각부 flash) + LSE 병합으로 |
+
+- `--no_fast`: 전부 끔. `--fast_disable quantize,attn`: 개별 끔 (A/B 비교용).
+- `--profile_steps 3,10`: 해당 스텝을 `torch.profiler`로 기록해 `profile_step{N}.txt/json`(버킷별 시간 + 상위 커널 30개)을 남긴다.
+
 ## 모델 크기
 
 기본은 **Qwen3.5-2B**(full attention 6층×8헤드라 9B 대비 어텐션 0.375배, 98K 토큰 스텝 추정 ~3배 빠름), 시간 제한 기본 5시간.

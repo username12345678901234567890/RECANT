@@ -9,6 +9,8 @@ import torch
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
+from . import prof
+
 
 def _ck(fn, *args):
     if torch.is_grad_enabled() and any(isinstance(a, torch.Tensor) and a.requires_grad for a in args):
@@ -21,7 +23,7 @@ def _ce_chunk(h, t, w):
     return F.cross_entropy(F.linear(h, w).float(), t, reduction="sum")
 
 
-def ce_sum(h, targets, w, chunk=512):
+def _ce_sum_impl(h, targets, w, chunk=512):
     total = h.new_zeros((), dtype=torch.float32)
     for s in range(0, h.shape[0], chunk):
         total = total + _ck(_ce_chunk, h[s:s + chunk], targets[s:s + chunk], w)
@@ -46,7 +48,7 @@ def _corr_chunk(h_sg, delta, g, w, ids, lp, tail):
     return _kl_packed(z1 + g[:, None].float() * z2, ids, lp, tail).sum()
 
 
-def corr_sum(h_sg, delta, g, w, ids, lp, tail, chunk=256):
+def _corr_sum_impl(h_sg, delta, g, w, ids, lp, tail, chunk=256):
     total = h_sg.new_zeros((), dtype=torch.float32)
     for s in range(0, h_sg.shape[0], chunk):
         sl = slice(s, s + chunk)
@@ -66,7 +68,7 @@ def _keep_chunk(h_sg, delta, g, w):
     return (lse2 - lse1 - g.float() * (p * z2).sum(-1)).sum()
 
 
-def keep_sum(h_sg, delta, g, w, chunk=128):
+def _keep_sum_impl(h_sg, delta, g, w, chunk=128):
     total = h_sg.new_zeros((), dtype=torch.float32)
     for s in range(0, h_sg.shape[0], chunk):
         sl = slice(s, s + chunk)
@@ -89,3 +91,18 @@ def pack_topk(logits, k=256):
 def kl_to_packed(logits, ids, lp, tail):
     """KL(p_full || softmax(logits)) per position for a packed p_full (used for the magnitude target)."""
     return _kl_packed(logits.float(), ids, lp, tail)
+
+
+def ce_sum(*a, **k):
+    with prof.rf("b:loss"):
+        return _ce_sum_impl(*a, **k)
+
+
+def corr_sum(*a, **k):
+    with prof.rf("b:loss"):
+        return _corr_sum_impl(*a, **k)
+
+
+def keep_sum(*a, **k):
+    with prof.rf("b:loss"):
+        return _keep_sum_impl(*a, **k)

@@ -126,7 +126,13 @@ def run(a) -> dict:
 
     # ---- model -----------------------------------------------------------------------
     cfg_m = TextConfig.from_hf(model_path)
+    from . import fast
+    from .profile_util import StepProfiler
+
+    fast.configure(a.no_fast, a.fast_disable)
+    profile_steps = {int(x) for x in str(a.profile_steps).split(",") if x.strip()}
     rep = backends.select_all(device, cfg_m, log)
+    rep["fast_paths"] = backends.select_fast_paths(device, cfg_m, log)
     write_json(out_dir / "backends.json", rep)
     quantize = not a.no_quantize
     model = load_hf(model_path, device=device, dtype=dtype, quantize=quantize, cfg=cfg_m, log=log)
@@ -268,6 +274,9 @@ def run(a) -> dict:
             norms = {k: sum(p.counts[k] for p in plans) for k in ("ce", "corr", "keep", "anchor")}
             t_step = time.time()
             agg, n_ok, tok = defaultdict(float), 0, 0
+            prof_cm = StepProfiler(out_dir, state["step"] + 1, log) if (state["step"] + 1) in profile_steps else None
+            if prof_cm:
+                prof_cm.__enter__()
             for t, plan in zip(trajs, plans):
                 m = guarded(t, plan, norms, gain)
                 if m is None:
@@ -281,6 +290,8 @@ def run(a) -> dict:
                         agg[k] = max(agg[k], v) if k == "peak_mem_gb" else agg[k] + v / max(len(trajs), 1)
                 if budget.done() or stop["flag"]:
                     break
+            if prof_cm:
+                prof_cm.__exit__(None, None, None)
             gnorm = float(torch.nn.utils.clip_grad_norm_(all_params, a.grad_clip)) if n_ok else float("nan")
             if n_ok and math.isfinite(gnorm) and math.isfinite(agg["loss"]):
                 opt.step()

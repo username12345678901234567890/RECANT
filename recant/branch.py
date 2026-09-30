@@ -21,6 +21,7 @@ import torch
 
 from .data.render import (F_COMMIT, T_ANCHOR, T_CALL_END, T_CALL_START, T_CE_END, T_CE_START, T_FLAGS,
                           T_START)
+from . import prof
 from .heads import GradScale
 from .losses import ce_sum, corr_sum, keep_sum, kl_to_packed, pack_topk
 
@@ -216,8 +217,9 @@ def run_trajectory(model, heads, traj: dict, plan: Plan, cfg: StepCfg, norms: di
     hint_t = torch.as_tensor(np.asarray(traj["hint"], dtype=np.int64), device=dev)
     n_layers = len(model.layers)
     t0 = _sync(dev)
-    xs, packed = pass_a(model, ids_t, hint_t, plan, cfg)
-    y, first4 = compute_targets(model, xs, plan, packed, cfg)
+    with prof.rf("p:pass_a"):
+        xs, packed = pass_a(model, ids_t, hint_t, plan, cfg)
+        y, first4 = compute_targets(model, xs, plan, packed, cfg)
     t1 = _sync(dev)
     P = torch.as_tensor(plan.P, device=dev)
     H = torch.as_tensor(plan.H, device=dev)
@@ -225,7 +227,7 @@ def run_trajectory(model, heads, traj: dict, plan: Plan, cfg: StepCfg, norms: di
     want_grad = train
     rows_final = xs[n_layers][P].detach().requires_grad_(want_grad)
     taps = [xs[i][H].detach().requires_grad_(want_grad and gain > 0) for i in taps_i]
-    with torch.set_grad_enabled(want_grad):
+    with prof.rf("p:heads"), torch.set_grad_enabled(want_grad):
         losses, stats = head_stage(model, heads, plan, packed, y, rows_final, lambda j: taps[j], gain, cfg, norms)
     t2 = _sync(dev)
     metrics = {
@@ -239,8 +241,9 @@ def run_trajectory(model, heads, traj: dict, plan: Plan, cfg: StepCfg, norms: di
     }
     if not train:
         return metrics
-    if losses["total"].requires_grad:
-        losses["total"].backward()
+    with prof.rf("p:heads"):
+        if losses["total"].requires_grad:
+            losses["total"].backward()
     g = torch.zeros(plan.n, model.c.hidden_size, dtype=model.dtype, device=dev)
     if rows_final.grad is not None:
         g.index_add_(0, P, rows_final.grad.to(g.dtype))
@@ -250,6 +253,8 @@ def run_trajectory(model, heads, traj: dict, plan: Plan, cfg: StepCfg, norms: di
             if taps[j].grad is not None:
                 tap_grads.setdefault(i, []).append(taps[j].grad.to(g.dtype))
     xs[n_layers] = None
+    _rev = prof.rf("p:reverse")
+    _rev.__enter__()
     for tg in tap_grads.get(n_layers, []):              # a tap on the final output itself
         g.index_add_(0, H, tg)
     for l in reversed(range(n_layers)):
@@ -263,6 +268,7 @@ def run_trajectory(model, heads, traj: dict, plan: Plan, cfg: StepCfg, norms: di
         g = x_in.grad if l > 0 else None
         xs[l] = None
         del out, x_in
+    _rev.__exit__(None, None, None)
     t3 = _sync(dev)
     metrics["t_reverse"] = t3 - t2
     if dev.type == "cuda":

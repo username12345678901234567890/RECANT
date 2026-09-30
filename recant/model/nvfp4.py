@@ -25,6 +25,8 @@ from dataclasses import dataclass
 import torch
 import torch.nn.functional as F
 
+from .. import prof
+
 BLOCK = 16
 FP4_MAX = 6.0
 E4M3_MAX = 448.0
@@ -48,7 +50,22 @@ _SIGNS = (torch.randint(0, 2, (16,), generator=torch.Generator().manual_seed(123
 
 
 def rht(x: torch.Tensor) -> torch.Tensor:
-    """Randomized Hadamard transform along the last dim, in blocks of 16 (orthogonal)."""
+    """Randomized Hadamard transform along the last dim, in blocks of 16 (orthogonal).
+
+    Implemented as sign flips + a 4-stage butterfly (strides 1,2,4,8) + an exact x0.25, in fp32, then cast
+    back to x.dtype. The fused Triton kernel uses the identical operation order, so results are bit-identical."""
+    k = x.shape[-1]
+    lead = (*x.shape[:-1], k // BLOCK)
+    y = x.float().reshape(*lead, BLOCK) * _SIGNS.to(x.device)
+    for s in (1, 2, 4, 8):
+        y = y.reshape(*lead, BLOCK // (2 * s), 2, s)
+        a, b = y[..., 0, :], y[..., 1, :]
+        y = torch.stack([a + b, a - b], dim=-2)
+    return (y.reshape(*lead, BLOCK) * 0.25).reshape(x.shape).to(x.dtype)
+
+
+def rht_matmul(x: torch.Tensor) -> torch.Tensor:
+    """Same transform as a matrix product (test reference; differs from `rht` only by fp32 rounding)."""
     k = x.shape[-1]
     y = x.float().reshape(*x.shape[:-1], k // BLOCK, BLOCK) * _SIGNS.to(x.device)
     return (y @ _H16.to(x.device)).reshape(x.shape).to(x.dtype)
@@ -179,7 +196,26 @@ def get_gemm_backend() -> str:
 
 
 def gemm_fp4(a: FP4Tensor, b: FP4Tensor) -> torch.Tensor:
-    return GEMM_BACKENDS[_state["gemm"]](a, b)
+    with prof.rf("b:fp4_gemm"):
+        return GEMM_BACKENDS[_state["gemm"]](a, b)
+
+
+_fast = {"quantize": False}
+
+
+def set_fast_quantizer(flag: bool) -> None:
+    _fast["quantize"] = bool(flag)
+
+
+def quantize_activation(x: torch.Tensor, use_rht: bool = True, stochastic: bool = False) -> FP4Tensor:
+    """RHT (optional) + NVFP4 quantization of an activation / gradient [M, K]. Uses the fused Triton kernel
+    when it was verified at startup (bit-identical to the reference for round-to-nearest)."""
+    with prof.rf("b:quantize"):
+        if _fast["quantize"] and x.is_cuda and x.dim() == 2 and x.shape[1] % BLOCK == 0:
+            from . import fp4_kernels
+
+            return fp4_kernels.quantize_fast(x.contiguous(), use_rht, stochastic)
+        return quantize(rht(x) if use_rht else x, stochastic)
 
 
 # --------------------------------------------------------------------------- autograd
@@ -190,7 +226,7 @@ class FP4Linear(torch.autograd.Function):
     def forward(ctx, x, w: FP4Weight):
         ctx.w = w
         x2 = x.reshape(-1, w.in_features)
-        a = quantize(rht(x2) if w.use_rht else x2)
+        a = quantize_activation(x2, w.use_rht)
         y = gemm_fp4(a, w.fprop)
         return y.reshape(*x.shape[:-1], w.out_features).to(x.dtype)
 
@@ -198,7 +234,7 @@ class FP4Linear(torch.autograd.Function):
     def backward(ctx, dy):
         w = ctx.w
         d2 = dy.reshape(-1, w.out_features)
-        d = quantize(rht(d2) if w.use_rht else d2, stochastic=True)
+        d = quantize_activation(d2, w.use_rht, stochastic=True)
         dx = gemm_fp4(d, w.dgrad)
         return dx.reshape(*dy.shape[:-1], w.in_features).to(dy.dtype), None
 
