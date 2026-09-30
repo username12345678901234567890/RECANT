@@ -30,6 +30,8 @@ class Qwen35(nn.Module):
         self.norm = RMSNorm(c.hidden_size, c.rms_norm_eps)
         self.lm_head = nn.Linear(c.hidden_size, c.vocab_size, bias=False, device=device, dtype=dtype)
         self.lm_head.weight.requires_grad_(False)
+        if c.tie_word_embeddings:            # 0.8B / 2B / 4B share the embedding matrix with the LM head
+            self.lm_head.weight = self.embed_tokens.weight
         self.device = device
 
     # ---- construction --------------------------------------------------------------
@@ -189,7 +191,16 @@ def load_hf(path: str | Path, device="cuda", dtype=torch.bfloat16, quantize=True
     model.layers = nn.ModuleList(layers)
     model.embed_tokens.weight.data = get(other["embed_tokens.weight"]).to(device, dtype)
     model.norm.weight.data = get(other["norm.weight"]).to(device, dtype)
-    model.lm_head.weight.data = get(other["lm_head.weight"]).to(device, dtype)
+    if "lm_head.weight" in other and not cfg.tie_word_embeddings:
+        model.lm_head.weight.data = get(other["lm_head.weight"]).to(device, dtype)
+    elif "lm_head.weight" in other:
+        log("[load] tie_word_embeddings=true: ignoring the checkpoint's separate lm_head.weight")
+    else:
+        if not cfg.tie_word_embeddings:
+            raise KeyError("checkpoint has no lm_head.weight but config.tie_word_embeddings is false")
+        log("[load] tied embeddings: LM head shares the embedding matrix")
+    model.lm_head.weight = model.embed_tokens.weight if cfg.tie_word_embeddings else model.lm_head.weight
+    model.lm_head.weight.requires_grad_(False)
     return model
 
 
@@ -207,7 +218,8 @@ def save_hf_layout(model: Qwen35, path: str | Path):
             sd["model.language_model." + n] = p.detach().cpu().contiguous()
     sd["model.language_model.embed_tokens.weight"] = model.embed_tokens.weight.detach().cpu().contiguous()
     sd["model.language_model.norm.weight"] = model.norm.weight.detach().cpu().contiguous()
-    sd["lm_head.weight"] = model.lm_head.weight.detach().cpu().contiguous()
+    if not model.c.tie_word_embeddings:
+        sd["lm_head.weight"] = model.lm_head.weight.detach().cpu().contiguous()
     save_file(sd, str(path / "model.safetensors"))
     c = model.c
     (path / "config.json").write_text(json.dumps({"model_type": "qwen3_5", "text_config": {
@@ -215,4 +227,5 @@ def save_hf_layout(model: Qwen35, path: str | Path):
            "num_attention_heads", "num_key_value_heads", "head_dim", "rms_norm_eps", "linear_conv_kernel_dim",
            "linear_key_head_dim", "linear_value_head_dim", "linear_num_key_heads", "linear_num_value_heads",
            "layer_types")},
+        "tie_word_embeddings": c.tie_word_embeddings,
         "rope_parameters": {"rope_theta": c.rope_theta, "partial_rotary_factor": c.partial_rotary_factor}}}))

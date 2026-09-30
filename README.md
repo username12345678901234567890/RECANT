@@ -1,7 +1,7 @@
 # RECANT
 
 **RE**versal **C**orrection from **AN**swer-conditioned **T**eacher — 번복 예측 보정 헤드
-(Qwen3.5-9B, NVFP4 고정 백본 + bf16 LoRA r=128, 보정 헤드 δ / 크기 헤드 m̂ / 게이트 g).
+(기본 백본 Qwen3.5-2B, NVFP4 고정 백본 + LoRA r=128, 보정 헤드 δ / 크기 헤드 m̂ / 게이트 g. 4B·9B도 같은 코드로 로드).
 
 이 저장소는 Kaggle 데이터셋으로 올려서 `/kaggle/input/...`에서 **복사 없이** 실행하도록 만들었다
 (레포 디렉터리는 읽기 전용으로 취급하고, 모든 캐시는 scratch로 돌린다).
@@ -11,7 +11,7 @@
 | 구성 | 상태 |
 | --- | --- |
 | `prep_wheels.py`, `prep_data.py` | 구현·실데이터 검증 (30M 토큰 end-to-end) |
-| 모델 (`recant/model/`) | GDN+attention 하이브리드, LoRA, NVFP4 백본. **HF `Qwen3_5ForCausalLM`과 로짓 일치**(테스트) |
+| 모델 (`recant/model/`) | GDN+attention 하이브리드, LoRA, NVFP4 백본, tied embedding(0.8B/2B/4B). **HF `Qwen3_5ForCausalLM`과 로짓 일치**(9B·2B 레이아웃 모두, 테스트) |
 | 분기 통합 pass + 수동 층별 역전파 (`recant/branch.py`) | 구현. `p_full`이 힌트 붙인 전체 시퀀스 forward와 일치, 역전파가 autograd와 일치(테스트) |
 | 헤드·손실·스케줄·저장·플래너·트레이너 (`train.py`) | 구현. CPU 작은 모델로 end-to-end(시간 제한 종료, 모의 OOM 복구, 크래시 시 저장 포함) |
 | **GPU 실행** | **미검증** — 이 저장소를 만든 환경에는 GPU가 없다. NVFP4 GEMM(`torch._scaled_mm`), fla GDN, sm_120 SDPA 경로는 시작 시 자동 점검(`backends.json`)으로 처음 통과한 후보를 쓰고 실패하면 참조 구현으로 내려간다 |
@@ -63,8 +63,8 @@ RECANT_TOKENIZER_DIR=/path/to/Qwen3.5-9B-tokenizer-dir python -m pytest tests -q
 
 ```
 !python /kaggle/input/recant/train.py \
-    --model_path /kaggle/input/qwen35-9b --wheel_dir /kaggle/input/recant-wheels \
-    --data_dir /kaggle/input/recant-data --time_limit_hours 10
+    --model_path /kaggle/input/qwen35-2b --wheel_dir /kaggle/input/recant-wheels \
+    --data_dir /kaggle/input/recant-data --time_limit_hours 5
 ```
 
 - `--model_path`/`--data_dir`는 중첩 디렉터리여도 `config.json`/`manifest.json`을 자동으로 찾는다. 휠·데이터는 zip 경로도 가능.
@@ -80,3 +80,9 @@ RECANT_TOKENIZER_DIR=/path/to/Qwen3.5-9B-tokenizer-dir python -m pytest tests -q
 한 trajectory의 흐름(`recant/branch.py`): 캐시 청크 forward로 본 스트림을 돌리며 층 입력을 기록(=활성 체크포인트) →
 샘플한 커밋 턴마다 캐시를 fork해 `힌트+턴`을 돌려 `p_full`(top-256+꼬리)만 저장 → 기록한 최종 hidden에서 `p_plain`·
 크기 타깃 계산 → 헤드/손실 → 층별로 입력에서 재계산하며 역전파. 본 forward를 별도로 한 번 더 돌지 않는다.
+
+## 모델 크기
+
+기본은 **Qwen3.5-2B**(full attention 6층×8헤드라 9B 대비 어텐션 0.375배, 98K 토큰 스텝 추정 ~3배 빠름), 시간 제한 기본 5시간.
+`--model_path`만 바꾸면 4B/9B도 된다(4B는 9B와 어텐션이 같아 이득이 작다). 토크나이저는 크기와 무관하게
+`tokenizer.json`이 동일해서 `prep_data.py`로 만든 데이터셋을 그대로 쓴다. 모델별로 LoRA·헤드는 따로 학습해야 한다.

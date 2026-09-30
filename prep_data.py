@@ -15,7 +15,8 @@ def parse_args(argv=None):
     default_out = "/kaggle/working/recant_data" if os.path.isdir("/kaggle/working") else "./recant_data_out"
     p.add_argument("--out_dir", default=default_out, help="final zip + prep_report.json (Kaggle working)")
     p.add_argument("--tmp_dir", default=None, help="scratch; default: auto-pick the roomiest of /tmp,/kaggle/temp,/dev/shm")
-    p.add_argument("--tokenizer", default="Qwen/Qwen3.5-9B", help="tokenizer dir or HF repo id")
+    p.add_argument("--tokenizer", default="Qwen/Qwen3.5-2B",
+                   help="tokenizer dir or HF repo id (tokenizer.json is byte-identical across Qwen3.5 sizes)")
     p.add_argument("--token_budget", type=int, default=400_000_000)
     p.add_argument("--max_seq_len", type=int, default=98304)
     p.add_argument("--overlength", choices=["drop", "truncate"], default="drop")

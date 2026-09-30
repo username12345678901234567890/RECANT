@@ -157,7 +157,11 @@ def run(a) -> dict:
         static = torch.cuda.memory_allocated() + 4 * n_params * 4 * 1.0     # + grads and Adam states
     else:
         total_mem, static = float("inf"), 0.0
-    mem = MemoryModel(static_bytes=static, bytes_per_token=a.bytes_per_token_prior)
+    itemsize = torch.tensor([], dtype=dtype).element_size()
+    # prior: layer-input checkpoints (L+1 rows of hidden) + one layer's recompute transients (~8 FFN-wide rows)
+    prior = a.bytes_per_token_prior or ((cfg_m.num_hidden_layers + 1) * cfg_m.hidden_size
+                                        + 8 * cfg_m.intermediate_size) * itemsize
+    mem = MemoryModel(static_bytes=static, bytes_per_token=prior)
     lengths = store.index["length"]
     planner = StepPlanner(train_idx, lengths, a.tokens_per_step, mem, a.vram_target * total_mem,
                           max_len=int(store.manifest.get("max_seq_len", max(lengths))), seed=a.seed)

@@ -5,20 +5,18 @@ from recant.model.config import TextConfig
 from recant.model.qwen35 import Qwen35, load_hf, save_hf_layout
 
 
-def tiny_model(seed=0, layers=4):
+def tiny_model(seed=0, layers=4, like_2b=False):
     torch.manual_seed(seed)
-    cfg = TextConfig.tiny(layers=layers)
+    cfg = TextConfig.tiny(layers=layers, like_2b=like_2b)
     m = Qwen35(cfg, device="cpu", dtype=torch.float32)
     m.init_random(std=0.05, seed=seed)
     return m
 
 
-def test_matches_hf_reference(tmp_path):
-    """Logits equal transformers' Qwen3_5ForCausalLM with the same random weights."""
-    tf = pytest.importorskip("transformers")
+def _hf_match(m):
+    pytest.importorskip("transformers")
     from transformers import Qwen3_5ForCausalLM, Qwen3_5TextConfig
 
-    m = tiny_model()
     c = m.c
     hf_cfg = Qwen3_5TextConfig(
         vocab_size=c.vocab_size, hidden_size=c.hidden_size, intermediate_size=c.intermediate_size,
@@ -30,7 +28,7 @@ def test_matches_hf_reference(tmp_path):
         rope_parameters={"rope_type": "default", "rope_theta": c.rope_theta,
                          "partial_rotary_factor": c.partial_rotary_factor, "mrope_section": [3, 2, 2],
                          "mrope_interleaved": True},
-        max_position_embeddings=4096, attention_bias=False, tie_word_embeddings=False)
+        max_position_embeddings=4096, attention_bias=False, tie_word_embeddings=c.tie_word_embeddings)
     hf = Qwen3_5ForCausalLM(hf_cfg).eval().float()
     sd = {}
     for n, p in m.named_parameters():
@@ -38,15 +36,28 @@ def test_matches_hf_reference(tmp_path):
             sd["model." + n] = p.detach().clone()
     sd["model.embed_tokens.weight"] = m.embed_tokens.weight.detach().clone()
     sd["model.norm.weight"] = m.norm.weight.detach().clone()
-    sd["lm_head.weight"] = m.lm_head.weight.detach().clone()
+    if not c.tie_word_embeddings:
+        sd["lm_head.weight"] = m.lm_head.weight.detach().clone()
     missing, unexpected = hf.load_state_dict(sd, strict=False)
     assert not unexpected, unexpected
-    assert not [k for k in missing if "rotary" not in k], missing
+    assert not [k for k in missing if "rotary" not in k and not (c.tie_word_embeddings and k == "lm_head.weight")], missing
     ids = torch.randint(0, c.vocab_size, (1, 37))
     with torch.no_grad():
         want = hf(input_ids=ids).logits
         got = m.forward_logits(ids)
     assert torch.allclose(got, want, atol=2e-4, rtol=1e-3), (got - want).abs().max()
+
+
+def test_matches_hf_reference():
+    """Logits equal transformers' Qwen3_5ForCausalLM with the same random weights (9B-style layout)."""
+    _hf_match(tiny_model())
+
+
+def test_matches_hf_reference_2b_layout():
+    """Same, for the 2B/0.8B layout: value heads == key heads (no repeat), GQA 4:1, tied embeddings."""
+    m = tiny_model(like_2b=True)
+    assert m.lm_head.weight is m.embed_tokens.weight
+    _hf_match(m)
 
 
 def test_chunked_cached_forward_equals_full():
@@ -148,3 +159,43 @@ def test_cached_attention_blocking_matches_unblocked():
         assert torch.allclose(ops.attn_cached(q, k, v), b, atol=1e-5)
     finally:
         ops.SCORE_BUDGET_BYTES = old
+
+
+def test_tied_checkpoint_roundtrip_and_fp4(tmp_path):
+    m = tiny_model(like_2b=True)
+    save_hf_layout(m, tmp_path / "ck")
+    from safetensors import safe_open
+
+    with safe_open(tmp_path / "ck" / "model.safetensors", "pt") as f:
+        assert "lm_head.weight" not in set(f.keys())          # like the real 2B checkpoint
+    for quant in (False, True):
+        q = load_hf(tmp_path / "ck", device="cpu", dtype=torch.float32, quantize=quant)
+        assert q.c.tie_word_embeddings and q.lm_head.weight is q.embed_tokens.weight
+        ids = torch.randint(0, q.c.vocab_size, (1, 24))
+        a, b = m.forward_logits(ids), q.forward_logits(ids)
+        if not quant:
+            assert torch.allclose(a, b, atol=1e-6)
+        else:
+            assert torch.nn.functional.cosine_similarity(a.flatten(), b.flatten(), dim=0) > 0.9
+
+
+def test_real_2b_config_structure():
+    """The actual Qwen3.5-2B config: 18 GDN + 6 attention layers, and every large linear is FP4-quantizable."""
+    import json
+    from pathlib import Path
+
+    from recant.model.layers import DecoderLayer, QLinear
+
+    cfg = TextConfig.from_hf(Path(__file__).parent / "qwen35_2b_config.json")
+    assert (cfg.hidden_size, cfg.intermediate_size, cfg.num_hidden_layers) == (2048, 6144, 24)
+    assert cfg.layer_types.count("full_attention") == 6 and cfg.layer_types.count("linear_attention") == 18
+    assert cfg.tie_word_embeddings and cfg.rotary_dim == 64
+    assert cfg.linear_num_key_heads == cfg.linear_num_value_heads == 16
+    for i in (0, 3):                                           # one GDN layer, one attention layer
+        with torch.device("meta"):
+            layer = DecoderLayer(cfg, i)
+        for name, mod in layer.named_modules():
+            if isinstance(mod, QLinear):
+                big = mod.out_features >= 256
+                assert mod.quantizable == big, (i, name, mod.out_features)
+                assert mod.in_features % 16 == 0 and mod.out_features % 16 == 0, name

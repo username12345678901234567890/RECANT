@@ -23,6 +23,7 @@ class TextConfig:
     linear_num_value_heads: int = 32
     rope_theta: float = 1e7
     partial_rotary_factor: float = 0.25
+    tie_word_embeddings: bool = False
     layer_types: list = field(default_factory=list)
 
     def __post_init__(self):
@@ -52,18 +53,28 @@ class TextConfig:
         if not isinstance(d, dict):
             p = Path(d)
             d = json.loads((p / "config.json" if p.is_dir() else p).read_text())
+        tie = d.get("tie_word_embeddings")
         d = d.get("text_config", d)
+        if tie is None:
+            tie = d.get("tie_word_embeddings", False)
         rope = d.get("rope_parameters") or {}
-        names = set(cls.__dataclass_fields__) - {"rope_theta", "partial_rotary_factor"}
+        names = set(cls.__dataclass_fields__) - {"rope_theta", "partial_rotary_factor", "tie_word_embeddings"}
         kw = {k: d[k] for k in names if k in d}
         kw["rope_theta"] = float(rope.get("rope_theta", d.get("rope_theta", 1e7)))
+        kw["tie_word_embeddings"] = bool(tie)
         kw["partial_rotary_factor"] = float(rope.get("partial_rotary_factor", d.get("partial_rotary_factor", 0.25)))
         return cls(**kw)
 
     @classmethod
-    def tiny(cls, vocab_size: int = 300, layers: int = 4) -> "TextConfig":
-        """Small config for CPU tests (same structure: 3 GDN : 1 full attention)."""
-        return cls(vocab_size=vocab_size, hidden_size=64, intermediate_size=128, num_hidden_layers=layers,
+    def tiny(cls, vocab_size: int = 300, layers: int = 4, tie: bool = False, like_2b: bool = False) -> "TextConfig":
+        """Small config for CPU tests (same structure: 3 GDN : 1 full attention). `like_2b` mirrors the
+        2B/0.8B head layout (value heads == key heads, i.e. no head repetition) and tied embeddings."""
+        if like_2b:
+            return cls(vocab_size=vocab_size, hidden_size=64, intermediate_size=192, num_hidden_layers=layers,
+                       num_attention_heads=4, num_key_value_heads=1, head_dim=32, linear_key_head_dim=16,
+                       linear_value_head_dim=16, linear_num_key_heads=4, linear_num_value_heads=4,
+                       rope_theta=10000.0, tie_word_embeddings=True)
+        return cls(vocab_size=vocab_size, tie_word_embeddings=tie, hidden_size=64, intermediate_size=128, num_hidden_layers=layers,
                    num_attention_heads=4, num_key_value_heads=2, head_dim=32, linear_key_head_dim=16,
                    linear_value_head_dim=16, linear_num_key_heads=2, linear_num_value_heads=4,
                    rope_theta=10000.0)
