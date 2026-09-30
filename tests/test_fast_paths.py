@@ -156,3 +156,12 @@ def test_profile_step_writes_files_and_keeps_results(tmp_path):
     lb = [json.loads(l)["loss"] for l in (b / "out" / "train.jsonl").read_text().splitlines()]
     assert la == pytest.approx(lb, rel=1e-4)
     assert "fast_paths" in json.loads((a / "out" / "backends.json").read_text())
+
+
+def test_heads_set_range_keeps_buffers_on_param_device():
+    """Regression: set_range() after heads.to(cuda) used to re-create the bins on the CPU."""
+    from recant.heads import Heads
+
+    h = Heads(16, n_taps=4, hidden=8, n_bins=11, y_max=8.0).to("meta")
+    h.set_range(3.0)
+    assert h.bin_centers.device.type == "meta" and h.bin_edges.device.type == "meta"

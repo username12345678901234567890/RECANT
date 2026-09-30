@@ -49,7 +49,7 @@ class Heads(nn.Module):
         if reset_gate:
             with torch.no_grad():
                 self.gate_b.fill_(self.gate_bias0 - float(self.gate_a) * float(y_max) / 2)
-        edges = torch.linspace(0.0, float(y_max), self.n_bins + 1)
+        edges = torch.linspace(0.0, float(y_max), self.n_bins + 1, device=self.gate_b.device)
         self.register_buffer("bin_edges", edges, persistent=True)
         self.register_buffer("bin_centers", (edges[:-1] + edges[1:]) / 2, persistent=True)
         self.y_max = float(y_max)
