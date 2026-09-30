@@ -212,6 +212,19 @@ def resolve_input(path: str, tmp_dir: Path, what: str) -> Path:
     return p
 
 
+def find_root(path: str | os.PathLike, marker: str, max_depth: int = 4) -> Path:
+    """Directory at/below `path` that contains `marker` (Kaggle mounts often add nesting such as
+    /kaggle/input/<ds>/transformers/9b/1/). Shallowest match wins."""
+    base = Path(path)
+    if (base / marker).exists():
+        return base
+    hits = sorted((p.parent for p in base.rglob(marker) if len(p.relative_to(base).parts) <= max_depth),
+                  key=lambda d: len(d.relative_to(base).parts))
+    if not hits:
+        raise FileNotFoundError(f"no {marker} under {path} (searched {max_depth} levels)")
+    return hits[0]
+
+
 def write_json(path: str | os.PathLike, obj) -> None:
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w") as f:

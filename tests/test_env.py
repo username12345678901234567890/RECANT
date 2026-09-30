@@ -36,3 +36,15 @@ def test_resolve_input_zip(tmp_path):
     assert env.resolve_input(str(tmp_path), tmp_path, "x") == tmp_path
     with pytest.raises(FileNotFoundError):
         env.resolve_input(str(tmp_path / "missing"), tmp_path, "x")
+
+
+def test_find_root_handles_kaggle_nesting(tmp_path):
+    nested = tmp_path / "qwen" / "transformers" / "9b" / "1"
+    nested.mkdir(parents=True)
+    (nested / "config.json").write_text("{}")
+    assert env.find_root(tmp_path / "qwen", "config.json") == nested
+    (tmp_path / "flat").mkdir()
+    (tmp_path / "flat" / "manifest.json").write_text("{}")
+    assert env.find_root(tmp_path / "flat", "manifest.json") == tmp_path / "flat"
+    with pytest.raises(FileNotFoundError):
+        env.find_root(tmp_path / "flat", "nope.json")
