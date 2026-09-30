@@ -97,6 +97,29 @@ RECANT_TOKENIZER_DIR=/path/to/Qwen3.5-9B-tokenizer-dir python -m pytest tests -q
 - `--no_fast`: 전부 끔. `--fast_disable quantize,attn`: 개별 끔 (A/B 비교용).
 - `--profile_steps 3,10`: 해당 스텝을 `torch.profiler`로 기록해 `profile_step{N}.txt/json`(버킷별 시간 + 상위 커널 30개)을 남긴다.
 
+## 4. 추론 API 서버 (GPU 세션)
+
+학습된 체크포인트(`adapter.safetensors`, `heads.safetensors`, `config.json`)를 OpenAI 호환 API로 띄운다. 학습과 같은 코드(FP4·RHT·LoRA·헤드)를 쓰고,
+`logits = W_U(h + g·δ)`를 학습 손실과 같은 방식(`z1 + g·z2`)으로 계산한다. 표준 라이브러리 HTTP 서버라 추가 휠이 필요 없고, 요청은 한 번에 하나씩(직렬) 처리한다.
+
+```
+!python /kaggle/input/recant/serve.py --model_path /kaggle/input/qwen35-2b --wheel_dir /kaggle/input/recant-wheels \
+    --checkpoint_dir /kaggle/input/recant-ckpt --tunnel
+```
+
+- 시작 로그에 **API 키**(없으면 자동 생성)와 URL이 나온다. 모든 요청에 `Authorization: Bearer <키>`가 필요하다(`/health` 제외).
+- Kaggle 노트북은 외부에서 직접 접속할 수 없으므로 `--tunnel`(cloudflared 빠른 터널)로 공개 URL을 만든다. GPU 세션의 인터넷이 켜져 있어야 하고,
+  바이너리는 `--tunnel_bin`으로 지정하거나 자동 다운로드한다. 실패해도 로컬 서버는 계속 돈다(`--host 0.0.0.0 --port 8000`).
+- 엔드포인트: `POST /v1/chat/completions`(스트리밍, `tools` 도구 호출, `reasoning_content`), `POST /v1/completions`, `GET /v1/models`, `GET /health`.
+- **RECANT 노브**(요청의 `"recant": {...}` 또는 서버 기본값 `POST /v1/recant/config`):
+  `mode`(`learned`=체크포인트 gate, `fixed`=`gate_fixed` 고정, `off`=베이스 모델), `gate_a`/`gate_b`(gate 직접 지정), `delta_scale`(보정 배율),
+  `gate_threshold`(E[m̂]가 이보다 작으면 g=0), `return_gate: true`(토큰별 g·E[m̂] 반환).
+- `POST /v1/recant/score`: `{"messages" | "prompt", "completion", "sweep": [{노브}, ...]}` — 프롬프트를 한 번만 prefill하고 노브 조합별
+  완성 로그확률과 베이스 대비 KL을 돌려준다. 재학습 없이 g를 스윕하는 용도.
+- 멀티턴/에이전트 루프에서 프롬프트가 이전 프롬프트+생성의 연장이면 스냅샷 캐시로 이어서 prefill한다(`usage.prompt_tokens_details.cached_tokens`).
+- 학습은 g≈0.01에서 이루어졌으므로 δ의 크기가 그에 맞춰져 있을 수 있다 — g를 0~1 사이에서 넓게 스윕할 것.
+- **GPU에서 아직 실행해 보지 않았다**(엔진·서버 로직은 CPU 테스트로 검증). 디코딩은 CUDA graph 없이 토큰당 소형 커널이 많아 초기 처리량이 낮을 수 있다.
+
 ## 모델 크기
 
 기본은 **Qwen3.5-2B**(full attention 6층×8헤드라 9B 대비 어텐션 0.375배, 98K 토큰 스텝 추정 ~3배 빠름), 시간 제한 기본 5시간.
